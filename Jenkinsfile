@@ -1,93 +1,73 @@
-// Jenkinsfile for building the Flask Docker image and optionally pushing it to a registry
-// Usage notes:
-// - Set DOCKER_REGISTRY (e.g. "index.docker.io/youruser") and DOCKER_CREDENTIALS_ID to enable push.
-// - This pipeline expects Docker to be available on the Jenkins agent (Docker Pipeline plugin).
-
 pipeline {
-  agent any
+    agent any
 
-  environment {
-    IMAGE = "flask-practice:${env.BUILD_NUMBER}"
-    // Optional: set DOCKER_REGISTRY and DOCKER_CREDENTIALS_ID in job or credentials bindings
-    DOCKER_REGISTRY = "${DOCKER_REGISTRY}"
-    DOCKER_CREDENTIALS_ID = "${DOCKER_CREDENTIALS_ID}"
-  }
-
-  options {
-    // Keep only the last 10 builds
-    buildDiscarder(logRotator(numToKeepStr: '10'))
-    timeout(time: 30, unit: 'MINUTES')
-  }
-
-  stages {
-    stage('Checkout') {
-      steps {
-        checkout scm
-      }
+    environment {
+        AWS_REGION = 'us-east-2'
+        AWS_ACCOUNT_ID = '279427096273'
+        ECR_REPO = 'dockerproject'
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        IMAGE_TAG = "v${BUILD_NUMBER}"
+        DOCKER_IMAGE = "${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
     }
 
-    stage('Install dependencies (sanity)') {
-      steps {
-        echo 'Installing Python deps (local agent) to verify requirements file is valid'
-        sh 'python -V || true'
-        sh 'pip --version || true'
-        sh 'pip install --user -r requirements.txt || true'
-      }
-    }
+    stages {
 
-    stage('Docker Build') {
-      steps {
-        script {
-          // docker.build returns an object we can push later
-          dockerImage = docker.build(env.IMAGE)
+        stage('Checkout Code') {
+            steps {
+                echo '🔹 Checking out source code from GitHub...'
+                git credentialsId: 'dockerhub-credentials', url: 'https://github.com/praneeth2216/docker.git', branch: 'main'
+            }
         }
-      }
-    }
 
-    stage('Docker Push') {
-      when {
-        expression { return env.DOCKER_REGISTRY?.trim() }
-      }
-      steps {
-        script {
-          def fullImage = "${env.DOCKER_REGISTRY}/${env.IMAGE}"
-          dockerImage = docker.build(fullImage)
-          docker.withRegistry("https://${env.DOCKER_REGISTRY}", env.DOCKER_CREDENTIALS_ID) {
-            dockerImage.push()
-            // Also push a 'latest' tag for convenience
-            dockerImage.push('latest')
-          }
+        stage('Docker Build') {
+            steps {
+                script {
+                    echo "🔹 Building Docker image: ${DOCKER_IMAGE}"
+                    def dockerImage = docker.build("${DOCKER_IMAGE}")
+                }
+            }
         }
-      }
+
+        stage('Login to AWS ECR') {
+            steps {
+                script {
+                    echo '🔹 Logging in to Amazon ECR...'
+                    sh '''
+                    aws ecr get-login-password --region ${AWS_REGION} \
+                        | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                    '''
+                }
+            }
+        }
+
+        stage('Push to AWS ECR') {
+            steps {
+                script {
+                    echo '🔹 Pushing image to ECR...'
+                    sh '''
+                    docker push ${DOCKER_IMAGE}
+                    '''
+                }
+            }
+        }
+
+        stage('Cleanup') {
+            steps {
+                echo '🧹 Cleaning up local Docker images...'
+                sh '''
+                docker rmi ${DOCKER_IMAGE} || true
+                '''
+            }
+        }
     }
 
-    stage('Smoke test (optional)') {
-      steps {
-        echo 'Running a lightweight smoke test by creating and hitting a container (if Docker available)'
-        sh '''
-        CONTAINER_ID=$(docker run -d -p 5001:5000 ${IMAGE} || true)
-        if [ -n "$CONTAINER_ID" ]; then
-          sleep 2
-          curl -f --retry 5 --retry-delay 1 http://localhost:5001/ || echo "Smoke test failed"
-          docker rm -f $CONTAINER_ID || true
-        else
-          echo "Could not start container for smoke test; skipping."
-        fi
-        '''
-      }
+    post {
+        success {
+            echo "✅ Build and Push Successful!"
+            echo "✅ Image available at: ${DOCKER_IMAGE}"
+        }
+        failure {
+            echo "❌ Build Failed! Please check Jenkins logs for details."
+        }
     }
-  }
-
-  post {
-    always {
-      archiveArtifacts artifacts: 'Dockerfile,app.py,requirements.txt,README.md', fingerprint: true
-      cleanWs()
-    }
-    success {
-      echo "Build ${env.BUILD_NUMBER} succeeded."
-    }
-    failure {
-      echo "Build ${env.BUILD_NUMBER} failed."
-    }
-  }
 }
